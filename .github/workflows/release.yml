@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract and validate version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [[ "${VERSION}" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "${CARGO_VERSION}" != "${VERSION}" ]; then
+            echo "::error::Cargo.toml version (${CARGO_VERSION}) does not match tag (${VERSION})"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for arm64 linux)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          STAGE="hyerix-mcp-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${{ matrix.target }}/release/hyerix-mcp" "dist/${STAGE}/"
+          cp README.md LICENSE "dist/${STAGE}/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          (cd dist && shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.validate.outputs.version }}"
+          $stage = "hyerix-mcp-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/hyerix-mcp.exe" "dist/$stage/"
+          Copy-Item README.md, LICENSE "dist/$stage/"
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$stage.zip").Hash.ToLower()
+          "$hash  $stage.zip" | Out-File -FilePath "dist/$stage.zip.sha256" -Encoding ascii
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/hyerix-mcp-*
+
+  publish:
+    name: Publish release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.validate.outputs.version }}
+          name: hyerix-mcp v${{ needs.validate.outputs.version }}
+          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
+          files: |
+            dist/hyerix-mcp-*.tar.gz
+            dist/hyerix-mcp-*.tar.gz.sha256
+            dist/hyerix-mcp-*.zip
+            dist/hyerix-mcp-*.zip.sha256
+          generate_release_notes: true
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: [validate, publish]
+    if: needs.validate.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hyerix/homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: hyerix/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Download SHA-256 sidecars from this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          mkdir sha
+          cd sha
+          for asset in \
+            "hyerix-mcp-${VERSION}-aarch64-apple-darwin.tar.gz.sha256" \
+            "hyerix-mcp-${VERSION}-x86_64-apple-darwin.tar.gz.sha256" \
+            "hyerix-mcp-${VERSION}-aarch64-unknown-linux-gnu.tar.gz.sha256" \
+            "hyerix-mcp-${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256"; do
+            gh release download "v${VERSION}" --repo "${{ github.repository }}" --pattern "$asset"
+          done
+
+      - name: Regenerate Formula/hyerix-mcp.rb
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          SHA_DARWIN_ARM=$(awk '{print $1}' "sha/hyerix-mcp-${VERSION}-aarch64-apple-darwin.tar.gz.sha256")
+          SHA_DARWIN_X86=$(awk '{print $1}' "sha/hyerix-mcp-${VERSION}-x86_64-apple-darwin.tar.gz.sha256")
+          SHA_LINUX_ARM=$(awk '{print $1}' "sha/hyerix-mcp-${VERSION}-aarch64-unknown-linux-gnu.tar.gz.sha256")
+          SHA_LINUX_X86=$(awk '{print $1}' "sha/hyerix-mcp-${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256")
+
+          cat > tap/Formula/hyerix-mcp.rb <<RUBY
+          class HyerixMcp < Formula
+            desc "MCP server for NATS — 14 read-safe stdio tools for AI agents"
+            homepage "https://hyerix.ai"
+            version "${VERSION}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/hyerix-mcp-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_ARM}"
+              end
+              on_intel do
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/hyerix-mcp-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_X86}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/hyerix-mcp-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              end
+              on_intel do
+                url "https://github.com/${REPO}/releases/download/v${VERSION}/hyerix-mcp-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "hyerix-mcp"
+            end
+
+            test do
+              assert_match "hyerix-mcp #{version}", shell_output("#{bin}/hyerix-mcp --version")
+            end
+          end
+          RUBY
+
+      - name: Commit and push to tap (skip if no diff)
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          git config user.name "Hyerix Intern"
+          git config user.email "hello@hyerix.ai"
+          git add Formula/hyerix-mcp.rb
+          if git diff --cached --quiet; then
+            echo "Formula already at v${VERSION} — nothing to commit."
+          else
+            git commit -m "hyerix-mcp ${VERSION}"
+            git push
+          fi
